@@ -1,0 +1,208 @@
+/* Global page styling */
+body {
+  font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, 'Roboto', Arial, sans-serif;
+  background-color: #f5f5f5;
+  color: #2c2c2c;
+  margin: 0;
+  padding: 2rem;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Editor layout: leave space for the signature sidebar on the right */
+#editor {
+  margin-right: 220px;
+}
+
+/* Container for PDF canvases */
+#pdf-canvas-container {
+  position: relative;
+}
+
+/* Page container: ensure relative positioning so annotations overlay correctly */
+.page-container {
+  position: relative;
+  margin-bottom: 1rem;
+}
+
+h1 {
+  color: #444;
+  margin-top: 0;
+  font-weight: 600;
+  font-size: 1.5rem;
+}
+
+/* Button styling */
+button {
+  padding: 0.625rem 1.25rem;
+  background-color: #1473e6;
+  border: none;
+  border-radius: 6px;
+  color: #fff;
+  cursor: pointer;
+  font-size: 0.9375rem;
+  font-weight: 500;
+  margin-right: 0.5rem;
+  transition: all 0.2s ease;
+  box-shadow: 0 2px 4px rgba(20, 115, 230, 0.15);
+}
+button:hover {
+  background-color: #0d66d0;
+  box-shadow: 0 4px 8px rgba(20, 115, 230, 0.2);
+  transform: translateY(-1px);
+}
+button:active {
+  transform: translateY(1px);
+  box-shadow: 0 1px 2px rgba(20, 115, 230, 0.15);
+}
+
+/* Editor and pages */
+#pdf-canvas-container .page-container {
+  margin-bottom: 2rem;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+  background-color: #fff;
+  border-radius: 8px;
+  overflow: hidden;
+  transition: all 0.3s ease;
+}
+
+#pdf-canvas-container .page-container:hover {
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.12);
+}
+
+canvas {
+  background-color: #fff;
+  display: block;
+  margin: 0 auto;
+  border: none;
+}
+
+/* Text inputs for annotations */
+.text-input {
+  border: 1px solid #e1e1e1;
+  padding: 0.5rem;
+  border-radius: 6px;
+  min-width: 120px;
+  font-size: 14px;
+  background-color: #fff;
+  position: absolute;
+  z-index: 10;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+  transition: all 0.2s ease;
+}
+
+.text-input:focus {
+  outline: none;
+  border-color: #1473e6;
+  box-shadow: 0 0 0 3px rgba(20, 115, 230, 0.15);
+}
+
+/* Signature modal styling */
+#signature-modal {
+  /* Hidden by default; becomes flex when triggered via JS */
+  display: none;
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.4);
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  backdrop-filter: blur(4px);
+}
+
+#signature-dialog {
+  background: #fff;
+  padding: 1.5rem;
+  border-radius: 12px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.16);
+  max-width: 500px;
+  width: 100%;
+  border: none;
+}
+
+#signature-dialog h3 {
+  margin-top: 0;
+  color: #2c2c2c;
+  font-size: 1.25rem;
+  font-weight: 500;
+  margin-bottom: 1.25rem;
+}
+
+#signature-pad {
+  border: 2px solid #e1e1e1;
+  border-radius: 8px;
+  background-color: #fff;
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.05);
+}
+
+/* Signature library sidebar */
+#signature-library {
+  position: fixed;
+  top: 0;
+  right: 0;
+  width: 280px;
+  height: 100%;
+  overflow-y: auto;
+  padding: 1.5rem;
+  z-index: 50;
+  border-left: 1px solid #e8e8e8;
+  background-color: #fff;
+  box-shadow: -4px 0 16px rgba(0, 0, 0, 0.06);
+  /* Hidden by default; toggled by JS */
+  display: none;
+}
+
+#signature-library h3 {
+  margin-top: 0;
+  font-size: 1.125rem;
+  font-weight: 500;
+  border-bottom: 1px solid #e8e8e8;
+  padding-bottom: 0.75rem;
+  margin-bottom: 1rem;
+  color: #2c2c2c;
+}
+
+#signature-library img {
+  border: 2px solid #e8e8e8;
+  background-color: #fff;
+  margin-bottom: 1rem;
+  border-radius: 8px;
+  cursor: grab;
+  transition: all 0.2s ease;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
+}
+
+#signature-library img:hover {
+  border-color: #1473e6;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+  transform: translateY(-2px);
+}
+
+/* Allow annotations (text and signatures) to receive pointer events so they can be dragged */
+.annotation {
+  pointer-events: auto;
+  position: absolute;
+  transition: transform 0.05s ease;
+}
+
+/* Annotation controls styling */
+.annotation-controls {
+  display: flex;
+  gap: 4px;
+  position: absolute;
+  top: -26px;
+  right: 0;
+}
+.annotation-controls .control-btn{
+  background-color: #c62828;   /* base red */
+  border: 1px solid #c62828;
+  color: #fff;
+}
+.annotation-controls .control-btn:hover{
+  background-color: #e53935;   /* lighter red on hover */
+  border-color: #e53935;
+}

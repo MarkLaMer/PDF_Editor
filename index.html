@@ -1,0 +1,706 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PDF Editor</title>
+  <!-- The majority of styling is handled by styles.css. -->
+  <!-- pdf.js library -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+  <!-- signature_pad library for freehand signatures -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/signature_pad/4.1.5/signature_pad.umd.min.js"></script>
+  <!-- Google Font for cursive typed signatures -->
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Great+Vibes&display=swap">
+
+  <!-- Custom site styles -->
+  <!-- Link directly to the root-level stylesheet.  Flask is configured to
+       serve files from the project root, so "styles.css" will be
+       accessible at the URL "/styles.css". -->
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <h1>Simple PDF Editor</h1>
+  <form id="upload-form" enctype="multipart/form-data">
+    <input type="file" name="pdf" accept="application/pdf" required />
+    <button type="submit">Open PDF</button>
+  </form>
+  <div id="editor" style="display:none;">
+    <button id="export-button">Export PDF</button>
+    <button id="toggle-signatures" style="margin-left: 0.5rem;">Add Signature</button>
+    <div id="pdf-canvas-container"></div>
+  </div>
+
+  <!-- Signature library sidebar (hidden until toggled) -->
+  <div id="signature-library">
+    <h3 style="margin-top:0;">Saved Signatures</h3>
+    <!-- signature thumbnails will be appended here -->
+  </div>
+
+  <!-- Signature Modal -->
+  <div id="signature-modal">
+    <div id="signature-dialog">
+      <h3>Create Signature</h3>
+      <div>
+        <label>
+          <input type="radio" name="sig-mode" value="typed" checked /> Type
+        </label>
+        <label>
+          <input type="radio" name="sig-mode" value="drawn" /> Draw
+        </label>
+      </div>
+      <div id="typed-signature" style="margin-top:0.5rem;">
+        <input id="typed-name" type="text" placeholder="Enter your name" />
+        <!-- Preview area for typed signatures -->
+        <div id="typed-preview" style="margin-top:0.5rem; font-family:'Great Vibes', cursive; font-size:32px;"></div>
+      </div>
+      <div id="drawn-signature" style="display:none; margin-top:0.5rem;">
+        <canvas id="signature-pad" width="400" height="150"></canvas>
+        <button type="button" id="clear-signature">Clear</button>
+      </div>
+      <div style="margin-top:1rem;">
+        <button type="button" id="save-signature">Save Signature</button>
+        <button type="button" id="cancel-signature">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const uploadForm = document.getElementById('upload-form');
+    const editor = document.getElementById('editor');
+    const pdfContainer = document.getElementById('pdf-canvas-container');
+    const exportButton = document.getElementById('export-button');
+    let pdfDoc = null;
+    let scale = 1.0;
+    let annotations = [];
+    // Store the server-side filename and the original human-friendly name
+    let uploadedFilename = null;
+    let uploadedOriginalName = null;
+    let signaturePad;
+    // keep track of the annotation being moved
+    let draggedAnnotation = null;
+    // track the offset between the mouse cursor and the top‑left corner of the
+    // annotation being dragged.  Without this, dropped annotations jump
+    // unpredictably relative to the cursor.
+    let dragOffsetX = 0;
+    let dragOffsetY = 0;
+    // Currently displayed control overlay for editing/resizing/deleting
+    let controlOverlay = null;
+
+    // handle upload
+    uploadForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const formData = new FormData(uploadForm);
+      const resp = await fetch('/upload', { method: 'POST', body: formData });
+      const data = await resp.json();
+      uploadedFilename = data.filename;
+      // capture the original filename returned by the server for naming exported files
+      uploadedOriginalName = data.original_name || null;
+      await loadPdf(`/uploads/${data.filename}`);
+      editor.style.display = 'block';
+    });
+
+    // load PDF using pdf.js
+    async function loadPdf(url) {
+      pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+      pdfDoc = await pdfjsLib.getDocument(url).promise;
+      pdfContainer.innerHTML = '';
+      annotations = [];
+      for (let i = 1; i <= pdfDoc.numPages; i++) {
+        const page = await pdfDoc.getPage(i);
+        const viewport = page.getViewport({ scale: 1.0 });
+        const canvas = document.createElement('canvas');
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+        const context = canvas.getContext('2d');
+        const renderContext = { canvasContext: context, viewport: viewport };
+        await page.render(renderContext).promise;
+        const pageDiv = document.createElement('div');
+        pageDiv.classList.add('page-container');
+        pageDiv.appendChild(canvas);
+        pdfContainer.appendChild(pageDiv);
+        // click handler to add text
+        // Use double click to create a new text input.  Single clicks are
+        // reserved for dragging existing annotations.  Users reported that
+        // single clicks created new text fields unintentionally when they
+        // wanted to move an annotation.
+        pageDiv.addEventListener('dblclick', (event) => {
+          // ignore if clicking on an existing input or modal
+          if (event.target.tagName === 'INPUT' || event.target.closest('#signature-modal')) return;
+          // Get click coordinates relative to canvas
+          const rect = canvas.getBoundingClientRect();
+          const x = event.clientX - rect.left;
+          const y = event.clientY - rect.top;
+          createTextInput(pageDiv, i - 1, x, y);
+        });
+        // drag and drop saved signatures
+        pageDiv.addEventListener('dragover', (event) => {
+          event.preventDefault();
+        });
+        pageDiv.addEventListener('drop', (event) => {
+          event.preventDefault();
+          try {
+            const data = JSON.parse(event.dataTransfer.getData('text/plain'));
+            /*
+             * Compute coordinates relative to the page container rather than
+             * just the canvas.  In prior versions, using the canvas
+             * bounding rectangle introduced offsets when moving
+             * annotations.  The page container's bounding rect
+             * accurately reflects the visual position of annotations in
+             * the preview, so using it ensures dropped annotations
+             * appear exactly where the user expects.
+             */
+            const rect = pageDiv.getBoundingClientRect();
+            const dropX = event.clientX - rect.left;
+            const dropY = event.clientY - rect.top;
+            if (data && data.filename) {
+              // Dropping a saved signature from the library onto the page
+              createSignatureAt(pageDiv, i - 1, dropX, dropY, data.filename);
+            } else if (data && data.annIndex !== undefined) {
+              // Reposition an existing annotation.  Subtract the drag
+              // offset recorded during dragstart so that the annotation
+              // lands exactly under the cursor.
+              const idx = parseInt(data.annIndex);
+              if (!isNaN(idx) && annotations[idx]) {
+                const newX = dropX - dragOffsetX;
+                const newY = dropY - dragOffsetY;
+                const ann = annotations[idx];
+                ann.x = newX;
+                ann.y = newY;
+                ann.pageIndex = i - 1;
+                if (draggedAnnotation) {
+                  const span = draggedAnnotation;
+                  span.style.left = newX + 'px';
+                  span.style.top = newY + 'px';
+                  // If the element has moved to a different page, append
+                  // it to the new page container.
+                  if (span.parentElement !== pageDiv) {
+                    span.parentElement.removeChild(span);
+                    pageDiv.appendChild(span);
+                  }
+                  draggedAnnotation = null;
+                }
+              }
+            }
+          } catch (err) {
+            console.error(err);
+          }
+        });
+      }
+    }
+
+    function createTextInput(container, pageIndex, x, y) {
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.className = 'text-input';
+      input.style.left = x + 'px';
+      input.style.top = y + 'px';
+      input.style.fontFamily = 'Arial';
+      input.size = 20;
+      container.appendChild(input);
+      input.focus();
+      input.addEventListener('blur', () => {
+        if (input.value.trim() !== '') {
+          const span = document.createElement('span');
+          span.className = 'annotation';
+          span.style.left = x + 'px';
+          span.style.top = y + 'px';
+          span.textContent = input.value;
+          container.insertBefore(span, input);
+          // push annotation and assign index
+          const annIndex = annotations.length;
+          annotations.push({ type: 'text', pageIndex, x, y, value: input.value });
+          span.dataset.annIndex = annIndex;
+          span.draggable = true;
+          span.style.cursor = 'move';
+          span.addEventListener('dragstart', (e) => {
+            // Record which annotation is being dragged and the offset
+            draggedAnnotation = span;
+            const rect = span.getBoundingClientRect();
+            dragOffsetX = e.clientX - rect.left;
+            dragOffsetY = e.clientY - rect.top;
+            e.dataTransfer.setData('text/plain', JSON.stringify({ annIndex }));
+          });
+          // Show controls on click for editing or deleting
+          span.addEventListener('click', (e) => {
+            e.stopPropagation();
+            showAnnotationControls(span);
+          });
+        }
+        input.remove();
+      });
+      // detect double click to insert signature
+      input.addEventListener('dblclick', () => {
+        openSignatureModal(pageIndex, x, y, input);
+      });
+    }
+
+    // Signature modal logic
+    const sigModal = document.getElementById('signature-modal');
+    const saveSigBtn = document.getElementById('save-signature');
+    const cancelSigBtn = document.getElementById('cancel-signature');
+    const sigModeInputs = document.querySelectorAll('input[name="sig-mode"]');
+    const typedSigDiv = document.getElementById('typed-signature');
+    const drawnSigDiv = document.getElementById('drawn-signature');
+    const typedNameInput = document.getElementById('typed-name');
+    const sigPadCanvas = document.getElementById('signature-pad');
+
+    function openSignatureModal(pageIndex, x, y, anchorInput) {
+      let shouldInsertOnPage = true;
+      // If no anchorInput is provided, we do not insert the signature directly
+      // onto the PDF; the signature will only appear in the sidebar until
+      // dragged.  This flag can be overridden by passing a boolean to
+      // openSignatureModal; for backwards compatibility, when no boolean is
+      // provided, the signature will be inserted if anchorInput exists.
+      if (typeof anchorInput === 'object' && anchorInput === null) {
+        shouldInsertOnPage = false;
+      }
+      // Show the modal and reset inputs
+      sigModal.style.display = 'flex';
+      typedNameInput.value = '';
+      // clear typed signature preview
+      document.getElementById('typed-preview').textContent = '';
+      // If the signature pad has been initialised, clear it; otherwise
+      // ignore.  Without this guard, opening the dialog before the
+      // SignaturePad is created (e.g. due to a race condition) will
+      // trigger an exception and lead to an "Error saving signature"
+      // alert even though the signature file may still be saved on the
+      // server.  See issue reported by users.
+      if (typeof signaturePad !== 'undefined' && signaturePad) {
+        signaturePad.clear();
+      }
+      // Save button handler.  Converts the typed or drawn signature into a
+      // PNG, uploads it to the server, and inserts it into the document.
+      saveSigBtn.onclick = async () => {
+        // Determine mode and create a dataURL for the signature
+        const mode = document.querySelector('input[name="sig-mode"]:checked').value;
+        let dataURL;
+        if (mode === 'typed') {
+          const name = typedNameInput.value.trim();
+          if (!name) {
+            alert('Please enter a name');
+            return;
+          }
+          dataURL = generateTypedSignatureImage(name);
+        } else {
+          // In draw mode, ensure the signature pad exists and contains
+          // strokes.  Otherwise, prompt the user to draw their signature.
+          if (!signaturePad || signaturePad.isEmpty()) {
+            alert('Please draw your signature');
+            return;
+          }
+          dataURL = signaturePad.toDataURL('image/png');
+        }
+        // Save the signature to the server
+        try {
+          const response = await fetch('/save_signature', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ dataURL })
+          });
+          if (!response.ok) {
+            alert('Failed to save signature');
+            return;
+          }
+          const result = await response.json();
+          const filename = result.filename;
+          // Add to library (even if later logic fails)
+          addSignatureToLibrary(filename, `/signatures/${filename}`);
+          if (shouldInsertOnPage && anchorInput && anchorInput.parentElement) {
+            // Insert the new signature directly into the page at the specified location
+            const pageContainer = anchorInput.parentElement;
+            // Use createSignatureAt to ensure consistent behaviour and store width/height
+            createSignatureAt(pageContainer, pageIndex, x, y, filename);
+            anchorInput.remove();
+          }
+          // Hide the modal after saving
+          sigModal.style.display = 'none';
+        } catch (err) {
+          console.error(err);
+          // Even if an error occurs, the signature might have been saved
+          // successfully.  Show a user-friendly alert and allow them to
+          // retry.  Do not discard the saved signature from the library.
+          alert('An error occurred while inserting the signature. The signature may still be saved in your library. Please try again.');
+        }
+      };
+      cancelSigBtn.onclick = () => {
+        sigModal.style.display = 'none';
+      };
+    }
+
+    // toggle typed/drawn signature mode
+    sigModeInputs.forEach(radio => {
+      radio.addEventListener('change', () => {
+        if (radio.value === 'typed' && radio.checked) {
+          typedSigDiv.style.display = 'block';
+          drawnSigDiv.style.display = 'none';
+        } else if (radio.value === 'drawn' && radio.checked) {
+          typedSigDiv.style.display = 'none';
+          drawnSigDiv.style.display = 'block';
+        }
+      });
+    });
+
+    // initialize SignaturePad after DOM ready
+    window.addEventListener('load', () => {
+      signaturePad = new SignaturePad(sigPadCanvas);
+      document.getElementById('clear-signature').onclick = () => signaturePad.clear();
+
+      // live preview for typed signatures
+      const typedPreview = document.getElementById('typed-preview');
+      typedNameInput.addEventListener('input', (event) => {
+        typedPreview.textContent = event.target.value;
+      });
+
+      // load existing signatures into the library
+      loadSignatureLibrary().catch(console.error);
+    });
+
+    // export button
+    exportButton.addEventListener('click', async () => {
+      // send annotations and filename to server
+      const response = await fetch('/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: uploadedFilename, original_name: uploadedOriginalName, annotations })
+      });
+      if (response.ok) {
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        /*
+         * Name the exported file based on the original human name if available.
+         * Remove the .pdf extension (case-insensitive) if present, append "-edited",
+         * and then add back the .pdf extension.  Fallback to the server filename
+         * if no original name exists.
+         */
+        let exportName = 'edited.pdf';
+        const nameToUse = uploadedOriginalName || uploadedFilename;
+        if (nameToUse) {
+          const match = nameToUse.match(/^(.*?)(\.pdf)?$/i);
+          if (match) {
+            const stem = match[1] || nameToUse;
+            exportName = stem + '-edited.pdf';
+          }
+        }
+        a.download = exportName;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        window.URL.revokeObjectURL(url);
+      } else {
+        alert('Failed to export PDF');
+      }
+    });
+
+    // Toggle the signature library and open the signature modal to create a new signature.
+    const toggleSignaturesButton = document.getElementById('toggle-signatures');
+    toggleSignaturesButton.addEventListener('click', () => {
+      const library = document.getElementById('signature-library');
+      // Show the library if hidden
+      if (library.style.display === 'none' || library.style.display === '') {
+        library.style.display = 'block';
+      }
+      // Open the signature modal to add a new signature.  We pass null for
+      // anchorInput and set shouldInsertOnPage to false by passing a
+      // sentinel null anchorInput.  This ensures the new signature only
+      // appears in the sidebar and does not automatically get drawn on
+      // the page.  The user can then drag it onto any page.
+      openSignatureModal(0, 0, 0, null);
+    });
+
+    // --------------------------------------------------------------------------
+    // Signature library helpers
+
+    /**
+     * Generate a PNG data URL for a typed signature using a canvas.  This
+     * converts the entered name into an image so that it can be saved
+     * alongside drawn signatures.
+     * @param {string} name
+     * @returns {string} data URL
+     */
+    function generateTypedSignatureImage(name) {
+      const fontSize = 48;
+      // Create a temporary canvas
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      ctx.font = `${fontSize}px 'Great Vibes', cursive`;
+      const textWidth = ctx.measureText(name).width;
+      // Set canvas size based on text
+      canvas.width = textWidth + 20;
+      canvas.height = fontSize + 20;
+      // Need to set font again after resizing
+      ctx.font = `${fontSize}px 'Great Vibes', cursive`;
+      ctx.fillStyle = '#000';
+      ctx.textBaseline = 'top';
+      ctx.fillText(name, 10, 10);
+      return canvas.toDataURL('image/png');
+    }
+
+    /**
+     * Add a saved signature to the side panel.  Creates an image element
+     * that can be dragged onto pages.
+     * @param {string} filename
+     * @param {string} src
+     */
+    function addSignatureToLibrary(filename, src) {
+      const library = document.getElementById('signature-library');
+      // ensure library is visible
+      library.style.display = 'block';
+      const wrapper = document.createElement('div');
+      wrapper.style.marginBottom = '0.5rem';
+      const img = document.createElement('img');
+      img.src = src;
+      img.style.maxWidth = '100%';
+      img.style.cursor = 'grab';
+      img.draggable = true;
+      // store filename for drag
+      img.dataset.filename = filename;
+      img.addEventListener('dragstart', (e) => {
+        e.dataTransfer.setData('text/plain', JSON.stringify({ filename }));
+      });
+      wrapper.appendChild(img);
+      library.appendChild(wrapper);
+    }
+
+    /**
+     * Load existing signatures from the server and populate the library.  This
+     * function fetches the list of saved signatures and adds each to the
+     * sidebar.
+     */
+    async function loadSignatureLibrary() {
+      try {
+        const resp = await fetch('/list_signatures');
+        if (!resp.ok) return;
+        const data = await resp.json();
+        if (!data.files) return;
+        data.files.forEach((filename) => {
+          const src = `/signatures/${filename}`;
+          addSignatureToLibrary(filename, src);
+        });
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    /**
+     * Create a signature overlay on a page at the specified coordinates.  Used
+     * when a signature is dropped from the library onto a page.
+     * @param {HTMLElement} container
+     * @param {number} pageIndex
+     * @param {number} x
+     * @param {number} y
+     * @param {string} filename
+     */
+    function createSignatureAt(container, pageIndex, x, y, filename) {
+      const span = document.createElement('span');
+      span.className = 'annotation';
+      span.style.left = x + 'px';
+      span.style.top = y + 'px';
+      // default signature size in DOM pixels
+      const defaultWidth = 200;
+      const defaultHeight = 100;
+      const img = document.createElement('img');
+      img.src = `/signatures/${filename}`;
+      img.style.width = defaultWidth + 'px';
+      img.style.height = defaultHeight + 'px';
+      span.appendChild(img);
+      container.appendChild(span);
+      // record the annotation and assign index, storing width/height for export
+      const annIndex = annotations.length;
+      annotations.push({ type: 'signature', pageIndex, x, y, value: { type: 'saved', filename }, width: defaultWidth, height: defaultHeight });
+      span.dataset.annIndex = annIndex;
+      span.draggable = true;
+      span.style.cursor = 'move';
+      span.addEventListener('dragstart', (ev) => {
+        draggedAnnotation = span;
+        const rect = span.getBoundingClientRect();
+        dragOffsetX = ev.clientX - rect.left;
+        dragOffsetY = ev.clientY - rect.top;
+        ev.dataTransfer.setData('text/plain', JSON.stringify({ annIndex }));
+      });
+      // Show controls on click (resize/delete)
+      span.addEventListener('click', (e) => {
+        e.stopPropagation();
+        showAnnotationControls(span);
+      });
+    }
+
+    // --------------------------------------------------------------------------
+    // Annotation control helpers
+
+    /**
+     * Remove any existing annotation control overlay from the page.  This is
+     * called before showing a new control overlay to ensure only one set of
+     * buttons is visible at a time.
+     */
+    function removeControls() {
+      if (controlOverlay && controlOverlay.parentElement) {
+        controlOverlay.parentElement.removeChild(controlOverlay);
+      }
+      controlOverlay = null;
+    }
+
+    /**
+     * Display resize/edit/delete controls for a given annotation span.  The
+     * controls differ based on the annotation type (signature vs text).
+     * @param {HTMLElement} span
+     */
+    function showAnnotationControls(span) {
+      removeControls();
+      const idx = parseInt(span.dataset.annIndex);
+      if (isNaN(idx) || !annotations[idx] || annotations[idx].removed) return;
+      const ann = annotations[idx];
+      const overlay = document.createElement('div');
+      overlay.className = 'annotation-controls';
+      overlay.style.position = 'absolute';
+      overlay.style.top = '-24px';
+      overlay.style.right = '0';
+      overlay.style.display = 'flex';
+      overlay.style.gap = '4px';
+      // Prevent overlay from starting a drag
+      overlay.addEventListener('mousedown', (e) => e.stopPropagation());
+      // Buttons for signatures
+      if (ann.type === 'signature') {
+        // enlarge button
+        const enlargeBtn = document.createElement('button');
+        enlargeBtn.textContent = '＋';
+        enlargeBtn.className = 'control-btn';
+        enlargeBtn.title = 'Enlarge signature';
+        enlargeBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          resizeAnnotation(span, idx, 1.2);
+        });
+        // shrink button
+        const shrinkBtn = document.createElement('button');
+        shrinkBtn.textContent = '－';
+        shrinkBtn.className = 'control-btn';
+        shrinkBtn.title = 'Shrink signature';
+        shrinkBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          resizeAnnotation(span, idx, 0.8);
+        });
+        // delete button
+        const delBtn = document.createElement('button');
+        delBtn.textContent = '🗑';
+        delBtn.className = 'control-btn';
+        delBtn.title = 'Delete signature';
+        delBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          deleteAnnotation(span, idx);
+        });
+        overlay.appendChild(enlargeBtn);
+        overlay.appendChild(shrinkBtn);
+        overlay.appendChild(delBtn);
+      } else if (ann.type === 'text') {
+        // edit button
+        const editBtn = document.createElement('button');
+        editBtn.textContent = '✎';
+        editBtn.className = 'control-btn';
+        editBtn.title = 'Edit text';
+        editBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          editTextAnnotation(span, idx);
+        });
+        // delete button
+        const delBtn = document.createElement('button');
+        delBtn.textContent = '🗑';
+        delBtn.className = 'control-btn';
+        delBtn.title = 'Delete text';
+        delBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          deleteAnnotation(span, idx);
+        });
+        overlay.appendChild(editBtn);
+        overlay.appendChild(delBtn);
+      }
+      span.appendChild(overlay);
+      controlOverlay = overlay;
+    }
+
+    /**
+     * Resize a signature annotation by a scale factor.  Updates both the
+     * annotation object (width/height) and the DOM element.
+     * @param {HTMLElement} span
+     * @param {number} idx
+     * @param {number} factor
+     */
+    function resizeAnnotation(span, idx, factor) {
+      const ann = annotations[idx];
+      if (!ann || ann.type !== 'signature') return;
+      // Determine current width/height if not already stored
+      if (!ann.width || !ann.height) {
+        const imgEl = span.querySelector('img');
+        if (imgEl) {
+          ann.width = imgEl.offsetWidth;
+          ann.height = imgEl.offsetHeight;
+        } else {
+          return;
+        }
+      }
+      ann.width = ann.width * factor;
+      ann.height = ann.height * factor;
+      // Apply CSS sizing
+      const imgEl = span.querySelector('img');
+      if (imgEl) {
+        imgEl.style.width = ann.width + 'px';
+        imgEl.style.height = ann.height + 'px';
+      }
+    }
+
+    /**
+     * Delete an annotation from both the DOM and the annotations array.  Marks
+     * the annotation as removed to skip it on export.
+     * @param {HTMLElement} span
+     * @param {number} idx
+     */
+    function deleteAnnotation(span, idx) {
+      const ann = annotations[idx];
+      if (ann) {
+        ann.removed = true;
+      }
+      span.remove();
+      removeControls();
+    }
+
+    /**
+     * Turn a text annotation into an editable input, allowing the user to
+     * modify its contents.  When editing finishes (on blur), the annotation
+     * text and annotation object are updated.
+     * @param {HTMLElement} span
+     * @param {number} idx
+     */
+    function editTextAnnotation(span, idx) {
+      const ann = annotations[idx];
+      if (!ann || ann.type !== 'text') return;
+      // Create an input at the same position
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.className = 'text-input';
+      input.value = ann.value;
+      input.style.position = 'absolute';
+      input.style.left = span.style.left;
+      input.style.top = span.style.top;
+      input.style.zIndex = 20;
+      const parent = span.parentElement;
+      parent.insertBefore(input, span);
+      span.style.display = 'none';
+      removeControls();
+      input.focus();
+      input.addEventListener('blur', () => {
+        if (input.value.trim() !== '') {
+          ann.value = input.value;
+          span.textContent = input.value;
+        }
+        span.style.display = '';
+        input.remove();
+      });
+    }
+
+    // Hide controls when clicking elsewhere on the document
+    document.addEventListener('click', () => {
+      removeControls();
+    });
+  </script>
+</body>
+</html>
