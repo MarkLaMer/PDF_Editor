@@ -15,7 +15,7 @@ You will also need a modern web browser to interact with the editor. The front e
 
 1. Clone or download this repository.
 
-2. Make sure you are in the `pdf_editor_split` directory.
+2. Make sure you are in the `pdf_editor` directory.
 
 3. Start the Flask server:
 ```bash
