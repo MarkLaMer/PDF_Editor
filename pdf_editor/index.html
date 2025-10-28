@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PDF Editor</title>
+  <style>
+    body { font-family: sans-serif; padding: 1rem; }
+    #pdf-canvas-container { position: relative; }
+    .page-container { margin-bottom: 1rem; position: relative; }
+    canvas { border: 1px solid #ccc; }
+    .annotation { position: absolute; pointer-events: none; }
+    .text-input { position: absolute; z-index: 10; border: 1px solid #ccc; }
+    #signature-modal { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); align-items: center; justify-content: center; }
+    #signature-dialog { background: #fff; padding: 1rem; border-radius: 4px; }
+    #signature-pad { border: 1px solid #ccc; }
+  </style>
+  <!-- pdf.js library -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+  <!-- signature_pad library for freehand signatures -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/signature_pad/4.1.5/signature_pad.umd.min.js"></script>
+  <!-- Google Font for cursive typed signatures -->
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Great+Vibes&display=swap">
+</head>
+<body>
+  <h1>Simple PDF Editor</h1>
+  <form id="upload-form" enctype="multipart/form-data">
+    <input type="file" name="pdf" accept="application/pdf" required />
+    <button type="submit">Upload PDF</button>
+  </form>
+  <div id="editor" style="display:none;">
+    <button id="export-button">Export PDF</button>
+    <div id="pdf-canvas-container"></div>
+  </div>
+
+  <!-- Signature Modal -->
+  <div id="signature-modal">
+    <div id="signature-dialog">
+      <h3>Create Signature</h3>
+      <div>
+        <label>
+          <input type="radio" name="sig-mode" value="typed" checked /> Type
+        </label>
+        <label>
+          <input type="radio" name="sig-mode" value="drawn" /> Draw
+        </label>
+      </div>
+      <div id="typed-signature" style="margin-top:0.5rem;">
+        <input id="typed-name" type="text" placeholder="Enter your name" />
+      </div>
+      <div id="drawn-signature" style="display:none; margin-top:0.5rem;">
+        <canvas id="signature-pad" width="400" height="150"></canvas>
+        <button type="button" id="clear-signature">Clear</button>
+      </div>
+      <div style="margin-top:1rem;">
+        <button type="button" id="save-signature">Save Signature</button>
+        <button type="button" id="cancel-signature">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const uploadForm = document.getElementById('upload-form');
+    const editor = document.getElementById('editor');
+    const pdfContainer = document.getElementById('pdf-canvas-container');
+    const exportButton = document.getElementById('export-button');
+    let pdfDoc = null;
+    let scale = 1.0;
+    let annotations = [];
+    let uploadedFilename = null;
+    let signaturePad;
+
+    // handle upload
+    uploadForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const formData = new FormData(uploadForm);
+      const resp = await fetch('/upload', { method: 'POST', body: formData });
+      const data = await resp.json();
+      uploadedFilename = data.filename;
+      await loadPdf(`/uploads/${data.filename}`);
+      editor.style.display = 'block';
+    });
+
+    // load PDF using pdf.js
+    async function loadPdf(url) {
+      pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+      pdfDoc = await pdfjsLib.getDocument(url).promise;
+      pdfContainer.innerHTML = '';
+      annotations = [];
+      for (let i = 1; i <= pdfDoc.numPages; i++) {
+        const page = await pdfDoc.getPage(i);
+        const viewport = page.getViewport({ scale: 1.0 });
+        const canvas = document.createElement('canvas');
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+        const context = canvas.getContext('2d');
+        const renderContext = { canvasContext: context, viewport: viewport };
+        await page.render(renderContext).promise;
+        const pageDiv = document.createElement('div');
+        pageDiv.classList.add('page-container');
+        pageDiv.appendChild(canvas);
+        pdfContainer.appendChild(pageDiv);
+        // click handler to add text
+        pageDiv.addEventListener('click', (event) => {
+          // ignore if clicking on an existing input or modal
+          if (event.target.tagName === 'INPUT' || event.target.closest('#signature-modal')) return;
+          const rect = canvas.getBoundingClientRect();
+          const x = event.clientX - rect.left;
+          const y = event.clientY - rect.top;
+          createTextInput(pageDiv, i - 1, x, y);
+        });
+      }
+    }
+
+    function createTextInput(container, pageIndex, x, y) {
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.className = 'text-input';
+      input.style.left = x + 'px';
+      input.style.top = y + 'px';
+      input.style.fontFamily = 'Arial';
+      input.size = 20;
+      container.appendChild(input);
+      input.focus();
+      input.addEventListener('blur', () => {
+        if (input.value.trim() !== '') {
+          const span = document.createElement('span');
+          span.className = 'annotation';
+          span.style.left = x + 'px';
+          span.style.top = y + 'px';
+          span.textContent = input.value;
+          container.insertBefore(span, input);
+          annotations.push({ type: 'text', pageIndex, x, y, value: input.value });
+        }
+        input.remove();
+      });
+      // detect double click to insert signature
+      input.addEventListener('dblclick', () => {
+        openSignatureModal(pageIndex, x, y, input);
+      });
+    }
+
+    // Signature modal logic
+    const sigModal = document.getElementById('signature-modal');
+    const saveSigBtn = document.getElementById('save-signature');
+    const cancelSigBtn = document.getElementById('cancel-signature');
+    const sigModeInputs = document.querySelectorAll('input[name="sig-mode"]');
+    const typedSigDiv = document.getElementById('typed-signature');
+    const drawnSigDiv = document.getElementById('drawn-signature');
+    const typedNameInput = document.getElementById('typed-name');
+    const sigPadCanvas = document.getElementById('signature-pad');
+
+    function openSignatureModal(pageIndex, x, y, anchorInput) {
+      sigModal.style.display = 'flex';
+      typedNameInput.value = '';
+      signaturePad.clear();
+      saveSigBtn.onclick = () => {
+        let sigData = null;
+        let typed = false;
+        if (document.querySelector('input[name="sig-mode"]:checked').value === 'typed') {
+          const name = typedNameInput.value.trim();
+          if (!name) { alert('Please enter a name'); return; }
+          sigData = { type: 'typed', text: name };
+          typed = true;
+        } else {
+          if (signaturePad.isEmpty()) { alert('Please draw your signature'); return; }
+          const dataURL = signaturePad.toDataURL('image/png');
+          sigData = { type: 'drawn', dataURL };
+        }
+        annotations.push({ type: 'signature', pageIndex, x, y, value: sigData });
+        // display signature overlay
+        const span = document.createElement('span');
+        span.className = 'annotation';
+        span.style.left = x + 'px';
+        span.style.top = y + 'px';
+        if (typed) {
+          span.textContent = sigData.text;
+          span.style.fontFamily = '"Great Vibes", cursive';
+          span.style.fontSize = '32px';
+        } else {
+          const img = document.createElement('img');
+          img.src = sigData.dataURL;
+          img.style.maxWidth = '200px';
+          img.style.maxHeight = '100px';
+          span.appendChild(img);
+        }
+        anchorInput.parentElement.insertBefore(span, anchorInput);
+        anchorInput.remove();
+        sigModal.style.display = 'none';
+      };
+      cancelSigBtn.onclick = () => {
+        sigModal.style.display = 'none';
+      };
+    }
+
+    // toggle typed/drawn signature mode
+    sigModeInputs.forEach(radio => {
+      radio.addEventListener('change', () => {
+        if (radio.value === 'typed' && radio.checked) {
+          typedSigDiv.style.display = 'block';
+          drawnSigDiv.style.display = 'none';
+        } else if (radio.value === 'drawn' && radio.checked) {
+          typedSigDiv.style.display = 'none';
+          drawnSigDiv.style.display = 'block';
+        }
+      });
+    });
+
+    // initialize SignaturePad after DOM ready
+    window.addEventListener('load', () => {
+      signaturePad = new SignaturePad(sigPadCanvas);
+      document.getElementById('clear-signature').onclick = () => signaturePad.clear();
+    });
+
+    // export button
+    exportButton.addEventListener('click', async () => {
+      // send annotations and filename to server
+      const response = await fetch('/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: uploadedFilename, annotations })
+      });
+      if (response.ok) {
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'edited.pdf';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        window.URL.revokeObjectURL(url);
+      } else {
+        alert('Failed to export PDF');
+      }
+    });
+  </script>
+</body>
+</html>
