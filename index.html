@@ -1,0 +1,1488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PDF Editor</title>
+  <!-- The majority of styling is handled by styles.css. -->
+  <!-- pdf.js library -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+  <!-- signature_pad library for freehand signatures -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/signature_pad/4.1.5/signature_pad.umd.min.js"></script>
+  <!-- Google Font for cursive typed signatures -->
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Great+Vibes&display=swap">
+
+  <!-- Custom site styles -->
+  <!-- Link directly to the root-level stylesheet.  Flask is configured to
+       serve files from the project root, so "styles.css" will be
+       accessible at the URL "/styles.css". -->
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <h1>Actually FREE PDF Editor</h1>
+  <form id="upload-form" enctype="multipart/form-data">
+    <input type="file" name="pdf" accept="application/pdf" required id="pdf-input" />
+    <button type="submit">Open PDF</button>
+  </form>
+  <div id="upload-status" style="margin-top: 0.5rem; color: #666; display: none;"></div>
+  <div id="editor" style="display:none;">
+    <button id="export-button">Export PDF</button>
+    <button id="toggle-signatures" style="margin-left: 0.5rem;">Add Signature</button>
+    <button id="new-pdf-button" style="margin-left: 0.5rem;">Open New PDF</button>
+    <div id="pdf-canvas-container"></div>
+  </div>
+
+  <!-- Confirmation modal for opening new PDF -->
+  <div id="new-pdf-modal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0, 0, 0, 0.4); align-items: center; justify-content: center; z-index: 1000;">
+    <div style="background: #fff; padding: 1.5rem; border-radius: 12px; box-shadow: 0 8px 32px rgba(0, 0, 0, 0.16); max-width: 400px; width: 100%;">
+      <h3 style="margin-top: 0;">Open New PDF</h3>
+      <p>You have unsaved changes. What would you like to do?</p>
+      <div style="display: flex; gap: 0.5rem; margin-top: 1rem; justify-content: flex-end;">
+        <button id="export-before-new" style="background-color: #1473e6;">Export</button>
+        <button id="cancel-new-pdf" style="background-color: #666;">Cancel</button>
+        <button id="discard-new-pdf" style="background-color: #c62828;">Discard</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Signature library sidebar (hidden until toggled) -->
+  <div id="signature-library">
+    <h3 style="margin-top:0;">Saved Signatures</h3>
+    <!-- signature thumbnails will be appended here -->
+  </div>
+
+  <!-- Signature Modal -->
+  <div id="signature-modal">
+    <div id="signature-dialog">
+      <h3>Create Signature</h3>
+      <div>
+        <label>
+          <input type="radio" name="sig-mode" value="typed" checked /> Type
+        </label>
+        <label>
+          <input type="radio" name="sig-mode" value="drawn" /> Draw
+        </label>
+      </div>
+      <div id="typed-signature" style="margin-top:0.5rem;">
+        <label style="display: block; margin-bottom: 0.5rem;">Font:</label>
+        <select id="font-select" style="width: 100%; padding: 0.5rem; margin-bottom: 0.5rem; border: 1px solid #e1e1e1; border-radius: 6px;"></select>
+        <input id="typed-name" type="text" placeholder="Enter your name" />
+        <!-- Preview area for typed signatures -->
+        <div id="typed-preview" style="margin-top:0.5rem; font-size:32px;"></div>
+      </div>
+      <div id="drawn-signature" style="display:none; margin-top:0.5rem;">
+        <canvas id="signature-pad" width="400" height="150"></canvas>
+        <button type="button" id="clear-signature">Clear</button>
+      </div>
+      <div style="margin-top:1rem;">
+        <button type="button" id="save-signature">Save Signature</button>
+        <button type="button" id="cancel-signature">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const uploadForm = document.getElementById('upload-form');
+    const pdfInput = document.getElementById('pdf-input');
+    const editor = document.getElementById('editor');
+    const pdfContainer = document.getElementById('pdf-canvas-container');
+    const exportButton = document.getElementById('export-button');
+    const uploadStatus = document.getElementById('upload-status');
+    let pdfDoc = null;
+    let scale = 1.0;
+    let annotations = [];
+    // Store PDF page dimensions for coordinate conversion
+    let pageDimensions = [];
+    // Store the server-side filename and the original human-friendly name
+    let uploadedFilename = null;
+    let uploadedOriginalName = null;
+    let signaturePad;
+    // keep track of the annotation being moved
+    let draggedAnnotation = null;
+    // track the offset between the mouse cursor and the top‑left corner of the
+    // annotation being dragged.  Without this, dropped annotations jump
+    // unpredictably relative to the cursor.
+    let dragOffsetX = 0;
+    let dragOffsetY = 0;
+    // Currently displayed control overlay for editing/resizing/deleting
+    let controlOverlay = null;
+
+    // Auto-submit when file is selected
+    pdfInput.addEventListener('change', () => {
+      if (pdfInput.files && pdfInput.files.length > 0) {
+        uploadForm.dispatchEvent(new Event('submit'));
+      }
+    });
+
+    // handle upload
+    uploadForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (!pdfInput.files || pdfInput.files.length === 0) {
+        uploadStatus.textContent = 'Please select a PDF file';
+        uploadStatus.style.display = 'block';
+        uploadStatus.style.color = '#c62828';
+        return;
+      }
+      uploadStatus.textContent = 'Uploading PDF...';
+      uploadStatus.style.display = 'block';
+      uploadStatus.style.color = '#666';
+      try {
+        const formData = new FormData(uploadForm);
+        const resp = await fetch('/upload', { method: 'POST', body: formData });
+        const data = await resp.json();
+        if (!resp.ok) {
+          uploadStatus.textContent = 'Error: ' + (data.error || 'Unknown error');
+          uploadStatus.style.color = '#c62828';
+          alert('Error uploading PDF: ' + (data.error || 'Unknown error'));
+          return;
+        }
+        if (!data.filename) {
+          uploadStatus.textContent = 'Error: Server did not return a filename';
+          uploadStatus.style.color = '#c62828';
+          alert('Error: Server did not return a filename');
+          return;
+        }
+        uploadStatus.textContent = 'Loading PDF...';
+        uploadedFilename = data.filename;
+        // capture the original filename returned by the server for naming exported files
+        uploadedOriginalName = data.original_name || null;
+        await loadPdf(`/uploads/${data.filename}`);
+        editor.style.display = 'block';
+        uploadStatus.style.display = 'none';
+        uploadForm.style.display = 'none';
+      } catch (err) {
+        console.error('Upload error:', err);
+        uploadStatus.textContent = 'Error: ' + err.message;
+        uploadStatus.style.color = '#c62828';
+        alert('Failed to upload PDF: ' + err.message);
+      }
+    });
+
+    // Helper functions to convert between viewport and PDF coordinates
+    // These use the page container's coordinate system, accounting for canvas position within container
+    function viewportToPdfCoords(viewportX, viewportY, pageIndex) {
+      const dims = pageDimensions[pageIndex];
+      if (!dims) return { x: viewportX, y: viewportY };
+      const pageDiv = pdfContainer.querySelectorAll('.page-container')[pageIndex];
+      if (!pageDiv) return { x: viewportX, y: viewportY };
+      const canvas = pageDiv.querySelector('canvas');
+      if (!canvas) return { x: viewportX, y: viewportY };
+      
+      // Get the canvas position relative to the page container
+      const pageRect = pageDiv.getBoundingClientRect();
+      const canvasRect = canvas.getBoundingClientRect();
+      const canvasOffsetX = canvasRect.left - pageRect.left;
+      const canvasOffsetY = canvasRect.top - pageRect.top;
+      
+      // Convert viewport coordinates (relative to page container) to canvas coordinates
+      const canvasX = viewportX - canvasOffsetX;
+      const canvasY = viewportY - canvasOffsetY;
+      
+      // Convert canvas coordinates to PDF coordinates
+      const scaleX = dims.width / canvasRect.width;
+      const scaleY = dims.height / canvasRect.height;
+      return {
+        x: canvasX * scaleX,
+        y: canvasY * scaleY
+      };
+    }
+
+    function pdfToViewportCoords(pdfX, pdfY, pageIndex) {
+      const dims = pageDimensions[pageIndex];
+      if (!dims) return { x: pdfX, y: pdfY };
+      const pageDiv = pdfContainer.querySelectorAll('.page-container')[pageIndex];
+      if (!pageDiv) return { x: pdfX, y: pdfY };
+      const canvas = pageDiv.querySelector('canvas');
+      if (!canvas) return { x: pdfX, y: pdfY };
+      
+      // Get the canvas position relative to the page container
+      const pageRect = pageDiv.getBoundingClientRect();
+      const canvasRect = canvas.getBoundingClientRect();
+      const canvasOffsetX = canvasRect.left - pageRect.left;
+      const canvasOffsetY = canvasRect.top - pageRect.top;
+      
+      // Convert PDF coordinates to canvas coordinates
+      const scaleX = canvasRect.width / dims.width;
+      const scaleY = canvasRect.height / dims.height;
+      const canvasX = pdfX * scaleX;
+      const canvasY = pdfY * scaleY;
+      
+      // Convert canvas coordinates to viewport coordinates (relative to page container)
+      return {
+        x: canvasX + canvasOffsetX,
+        y: canvasY + canvasOffsetY
+      };
+    }
+
+    // Update annotation positions and sizes when window resizes
+    function updateAnnotationPositions() {
+      annotations.forEach((ann, idx) => {
+        if (ann.removed) return;
+        const pageDiv = pdfContainer.querySelectorAll('.page-container')[ann.pageIndex];
+        if (!pageDiv) return;
+        const span = pageDiv.querySelector(`[data-ann-index="${idx}"]`);
+        if (!span) return;
+        // Update position
+        const coords = pdfToViewportCoords(ann.x, ann.y, ann.pageIndex);
+        span.style.left = coords.x + 'px';
+        span.style.top = coords.y + 'px';
+        // Update size for signatures
+        if (ann.type === 'signature' && ann.width && ann.height) {
+          const dims = pageDimensions[ann.pageIndex];
+          if (dims) {
+            const canvas = pageDiv.querySelector('canvas');
+            if (canvas) {
+              const rect = canvas.getBoundingClientRect();
+              const scaleX = rect.width / dims.width;
+              const scaleY = rect.height / dims.height;
+              const viewportWidth = ann.width * scaleX;
+              const viewportHeight = ann.height * scaleY;
+              const imgEl = span.querySelector('img');
+              if (imgEl) {
+                // Maintain aspect ratio
+                const naturalWidth = imgEl.naturalWidth || 1;
+                const naturalHeight = imgEl.naturalHeight || 1;
+                const aspectRatio = naturalWidth / naturalHeight;
+                const finalHeight = viewportWidth / aspectRatio;
+                imgEl.style.width = viewportWidth + 'px';
+                imgEl.style.height = finalHeight + 'px';
+              }
+            }
+          }
+        }
+      });
+    }
+
+    // load PDF using pdf.js
+    async function loadPdf(url) {
+      try {
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+        pdfDoc = await pdfjsLib.getDocument(url).promise;
+        pdfContainer.innerHTML = '';
+        annotations = [];
+        pageDimensions = [];
+        for (let i = 1; i <= pdfDoc.numPages; i++) {
+          const page = await pdfDoc.getPage(i);
+          const viewport = page.getViewport({ scale: 1.0 });
+          // Store PDF page dimensions (in points)
+          pageDimensions[i - 1] = {
+            width: viewport.width,
+            height: viewport.height
+          };
+          const canvas = document.createElement('canvas');
+          canvas.width = viewport.width;
+          canvas.height = viewport.height;
+          const context = canvas.getContext('2d');
+          const renderContext = { canvasContext: context, viewport: viewport };
+          await page.render(renderContext).promise;
+          const pageDiv = document.createElement('div');
+          pageDiv.classList.add('page-container');
+          pageDiv.appendChild(canvas);
+          pdfContainer.appendChild(pageDiv);
+        // click handler to add text
+        // Use double click to create a new text input.  Single clicks are
+        // reserved for dragging existing annotations.  Users reported that
+        // single clicks created new text fields unintentionally when they
+        // wanted to move an annotation.
+        pageDiv.addEventListener('dblclick', (event) => {
+          // ignore if clicking on an existing input or modal
+          if (event.target.tagName === 'INPUT' || event.target.closest('#signature-modal')) return;
+          // Get click coordinates relative to page container (not canvas)
+          const pageRect = pageDiv.getBoundingClientRect();
+          const viewportX = event.clientX - pageRect.left;
+          const viewportY = event.clientY - pageRect.top;
+          // Convert to PDF coordinates
+          const pdfCoords = viewportToPdfCoords(viewportX, viewportY, i - 1);
+          createTextInput(pageDiv, i - 1, pdfCoords.x, pdfCoords.y, viewportX, viewportY);
+        });
+        // drag and drop saved signatures
+        pageDiv.addEventListener('dragover', (event) => {
+          event.preventDefault();
+        });
+        pageDiv.addEventListener('drop', (event) => {
+          event.preventDefault();
+          try {
+            const data = JSON.parse(event.dataTransfer.getData('text/plain'));
+            /*
+             * Compute coordinates relative to the page container rather than
+             * just the canvas.  In prior versions, using the canvas
+             * bounding rectangle introduced offsets when moving
+             * annotations.  The page container's bounding rect
+             * accurately reflects the visual position of annotations in
+             * the preview, so using it ensures dropped annotations
+             * appear exactly where the user expects.
+             */
+            // Get drop coordinates relative to the page container (not the window)
+            const pageRect = pageDiv.getBoundingClientRect();
+            const dropX = event.clientX - pageRect.left;
+            const dropY = event.clientY - pageRect.top;
+            if (data && data.filename) {
+              // Dropping a saved signature from the library onto the page
+              // Convert viewport coordinates (relative to page container) to PDF coordinates
+              const pdfCoords = viewportToPdfCoords(dropX, dropY, i - 1);
+              createSignatureAt(pageDiv, i - 1, pdfCoords.x, pdfCoords.y, dropX, dropY, data.filename);
+            } else if (data && data.annIndex !== undefined) {
+              // Reposition an existing annotation.  Subtract the drag
+              // offset recorded during dragstart so that the annotation
+              // lands exactly under the cursor.
+              const idx = parseInt(data.annIndex);
+              if (!isNaN(idx) && annotations[idx]) {
+                const viewportNewX = dropX - dragOffsetX;
+                const viewportNewY = dropY - dragOffsetY;
+                // Convert to PDF coordinates
+                const pdfCoords = viewportToPdfCoords(viewportNewX, viewportNewY, i - 1);
+                const ann = annotations[idx];
+                ann.x = pdfCoords.x;
+                ann.y = pdfCoords.y;
+                ann.pageIndex = i - 1;
+                if (draggedAnnotation) {
+                  const span = draggedAnnotation;
+                  span.style.left = viewportNewX + 'px';
+                  span.style.top = viewportNewY + 'px';
+                  // If the element has moved to a different page, append
+                  // it to the new page container.
+                  if (span.parentElement !== pageDiv) {
+                    span.parentElement.removeChild(span);
+                    pageDiv.appendChild(span);
+                  }
+                  draggedAnnotation = null;
+                }
+              }
+            }
+          } catch (err) {
+            console.error(err);
+          }
+        });
+        }
+      } catch (err) {
+        console.error('Error loading PDF:', err);
+        alert('Failed to load PDF: ' + (err.message || 'Unknown error. Please check the browser console for details.'));
+        throw err; // Re-throw to let the upload handler know it failed
+      }
+    }
+
+    function createTextInput(container, pageIndex, pdfX, pdfY, viewportX, viewportY) {
+      // Use viewport coordinates for display
+      const displayX = viewportX !== undefined ? viewportX : pdfToViewportCoords(pdfX, pdfY, pageIndex).x;
+      const displayY = viewportY !== undefined ? viewportY : pdfToViewportCoords(pdfX, pdfY, pageIndex).y;
+      
+      // Create bounding box wrapper
+      const span = document.createElement('span');
+      span.className = 'annotation text-annotation';
+      span.style.left = displayX + 'px';
+      span.style.top = displayY + 'px';
+      span.style.width = '200px';
+      span.style.height = '40px';
+      span.style.display = 'block';
+      span.style.position = 'absolute';
+      container.appendChild(span);
+      
+      // Create visible textarea for text entry (supports multi-line)
+      const textarea = document.createElement('textarea');
+      textarea.style.width = '100%';
+      textarea.style.height = '100%';
+      textarea.style.border = '2px dashed #1473e6';
+      textarea.style.background = 'rgba(20, 115, 230, 0.05)';
+      textarea.style.padding = '0.5rem';
+      textarea.style.fontSize = '14px';
+      textarea.style.fontFamily = 'Arial, sans-serif';
+      textarea.style.outline = 'none';
+      textarea.style.boxSizing = 'border-box';
+      textarea.style.resize = 'none';
+      textarea.style.overflow = 'auto';
+      textarea.style.overflowY = 'auto';
+      textarea.style.wordWrap = 'break-word';
+      textarea.style.whiteSpace = 'pre-wrap';
+      textarea.style.overflowWrap = 'break-word';
+      span.appendChild(textarea);
+      
+      let isResizingBox = false;
+      let resizeStartX = 0;
+      let resizeStartY = 0;
+      let resizeStartWidth = 0;
+      let resizeStartHeight = 0;
+      
+      // Make bounding box resizable with handle
+      const resizeHandle = document.createElement('div');
+      resizeHandle.className = 'resize-handle se';
+      resizeHandle.style.position = 'absolute';
+      resizeHandle.style.bottom = '-4px';
+      resizeHandle.style.right = '-4px';
+      resizeHandle.style.zIndex = '1001';
+      span.appendChild(resizeHandle);
+      
+      resizeHandle.addEventListener('mousedown', (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        isResizingBox = true;
+        const rect = span.getBoundingClientRect();
+        resizeStartX = e.clientX;
+        resizeStartY = e.clientY;
+        resizeStartWidth = rect.width;
+        resizeStartHeight = rect.height;
+        document.addEventListener('mousemove', handleBoxResize);
+        document.addEventListener('mouseup', stopBoxResize);
+      });
+      
+      function handleBoxResize(e) {
+        if (!isResizingBox) return;
+        e.preventDefault();
+        const deltaX = e.clientX - resizeStartX;
+        const deltaY = e.clientY - resizeStartY;
+        const newWidth = Math.max(100, resizeStartWidth + deltaX);
+        const newHeight = Math.max(30, resizeStartHeight + deltaY);
+        span.style.width = newWidth + 'px';
+        span.style.height = newHeight + 'px';
+        // Update textarea size
+        const textarea = span.querySelector('textarea');
+        if (textarea) {
+          textarea.style.width = '100%';
+          textarea.style.height = '100%';
+        }
+      }
+      
+      function stopBoxResize() {
+        isResizingBox = false;
+        document.removeEventListener('mousemove', handleBoxResize);
+        document.removeEventListener('mouseup', stopBoxResize);
+        // Update annotation dimensions
+        const idx = parseInt(span.dataset.annIndex);
+        if (!isNaN(idx) && annotations[idx]) {
+          const ann = annotations[idx];
+          const dims = pageDimensions[ann.pageIndex];
+          if (dims) {
+            const canvas = container.querySelector('canvas');
+            if (canvas) {
+              const rect = canvas.getBoundingClientRect();
+              const scaleX = dims.width / rect.width;
+              const scaleY = dims.height / rect.height;
+              ann.width = parseFloat(span.style.width) * scaleX;
+              ann.height = parseFloat(span.style.height) * scaleY;
+            }
+          }
+        }
+      }
+      
+      // Make span draggable
+      span.draggable = true;
+      span.style.cursor = 'move';
+      
+      // Auto-resize textarea height based on content
+      function autoResizeTextarea() {
+        textarea.style.height = 'auto';
+        textarea.style.height = Math.max(30, textarea.scrollHeight) + 'px';
+        span.style.height = textarea.style.height;
+      }
+      
+      textarea.addEventListener('input', autoResizeTextarea);
+      
+      // Handle drag
+      span.addEventListener('dragstart', (e) => {
+        if (e.target === textarea || e.target === resizeHandle) {
+          e.preventDefault();
+          return;
+        }
+        draggedAnnotation = span;
+        const rect = span.getBoundingClientRect();
+        dragOffsetX = e.clientX - rect.left;
+        dragOffsetY = e.clientY - rect.top;
+        const annIndex = parseInt(span.dataset.annIndex);
+        if (!isNaN(annIndex)) {
+          e.dataTransfer.setData('text/plain', JSON.stringify({ annIndex }));
+        }
+      });
+      
+      // Create annotation when text is entered
+      textarea.addEventListener('blur', () => {
+        const value = textarea.value.trim();
+        if (value !== '') {
+          const rect = span.getBoundingClientRect();
+          const pageRect = container.getBoundingClientRect();
+          
+          // Convert to PDF coordinates
+          const pdfCoords = viewportToPdfCoords(rect.left - pageRect.left, rect.top - pageRect.top, pageIndex);
+          const dims = pageDimensions[pageIndex];
+          let pdfWidth = rect.width;
+          let pdfHeight = rect.height;
+          if (dims) {
+            const canvas = container.querySelector('canvas');
+            if (canvas) {
+              const canvasRect = canvas.getBoundingClientRect();
+              const scaleX = dims.width / canvasRect.width;
+              const scaleY = dims.height / canvasRect.height;
+              pdfWidth = rect.width * scaleX;
+              pdfHeight = rect.height * scaleY;
+            }
+          }
+          
+          // Store annotation
+          const annIndex = annotations.length;
+          annotations.push({ 
+            type: 'text', 
+            pageIndex, 
+            x: pdfCoords.x, 
+            y: pdfCoords.y, 
+            value: value,
+            width: pdfWidth,
+            height: pdfHeight
+          });
+          span.dataset.annIndex = annIndex;
+          
+          // Change textarea to display mode but keep it editable
+          textarea.style.border = 'none';
+          textarea.style.background = 'transparent';
+          textarea.style.cursor = 'text';
+          textarea.readOnly = false;
+          
+          // Show controls on click
+          span.addEventListener('click', (e) => {
+            if (e.target === resizeHandle) return;
+            e.stopPropagation();
+            showAnnotationControls(span);
+          });
+        } else {
+          // Empty text, remove the element
+          span.remove();
+        }
+      });
+      
+      // Allow editing by clicking on the text
+      textarea.addEventListener('dblclick', (e) => {
+        e.stopPropagation();
+        textarea.select();
+      });
+      
+      // Focus textarea when bounding box is created
+      setTimeout(() => textarea.focus(), 10);
+    }
+
+    // Signature modal logic
+    const sigModal = document.getElementById('signature-modal');
+    const saveSigBtn = document.getElementById('save-signature');
+    const cancelSigBtn = document.getElementById('cancel-signature');
+    const sigModeInputs = document.querySelectorAll('input[name="sig-mode"]');
+    const typedSigDiv = document.getElementById('typed-signature');
+    const drawnSigDiv = document.getElementById('drawn-signature');
+    const typedNameInput = document.getElementById('typed-name');
+    const sigPadCanvas = document.getElementById('signature-pad');
+
+    function openSignatureModal(pageIndex, x, y, anchorInput) {
+      let shouldInsertOnPage = true;
+      // If no anchorInput is provided, we do not insert the signature directly
+      // onto the PDF; the signature will only appear in the sidebar until
+      // dragged.  This flag can be overridden by passing a boolean to
+      // openSignatureModal; for backwards compatibility, when no boolean is
+      // provided, the signature will be inserted if anchorInput exists.
+      if (typeof anchorInput === 'object' && anchorInput === null) {
+        shouldInsertOnPage = false;
+      }
+      // Show the modal and reset inputs
+      sigModal.style.display = 'flex';
+      typedNameInput.value = '';
+      // clear typed signature preview
+      document.getElementById('typed-preview').textContent = '';
+      // If the signature pad has been initialised, clear it; otherwise
+      // ignore.  Without this guard, opening the dialog before the
+      // SignaturePad is created (e.g. due to a race condition) will
+      // trigger an exception and lead to an "Error saving signature"
+      // alert even though the signature file may still be saved on the
+      // server.  See issue reported by users.
+      if (typeof signaturePad !== 'undefined' && signaturePad) {
+        signaturePad.clear();
+      }
+      // Save button handler.  Converts the typed or drawn signature into a
+      // PNG, uploads it to the server, and inserts it into the document.
+      saveSigBtn.onclick = async () => {
+        // Determine mode and create a dataURL for the signature
+        const mode = document.querySelector('input[name="sig-mode"]:checked').value;
+        let dataURL;
+        if (mode === 'typed') {
+          const name = typedNameInput.value.trim();
+          if (!name) {
+            alert('Please enter a name');
+            return;
+          }
+          const fontName = document.getElementById('font-select').value;
+          dataURL = await generateTypedSignatureImage(name, fontName);
+        } else {
+          // In draw mode, ensure the signature pad exists and contains
+          // strokes.  Otherwise, prompt the user to draw their signature.
+          if (!signaturePad || signaturePad.isEmpty()) {
+            alert('Please draw your signature');
+            return;
+          }
+          dataURL = signaturePad.toDataURL('image/png');
+        }
+        // Save the signature to the server
+        try {
+          const response = await fetch('/save_signature', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ dataURL })
+          });
+          if (!response.ok) {
+            alert('Failed to save signature');
+            return;
+          }
+          const result = await response.json();
+          const filename = result.filename;
+          // Add to library (even if later logic fails)
+          addSignatureToLibrary(filename, `/signatures/${filename}`);
+          if (shouldInsertOnPage && anchorInput && anchorInput.parentElement) {
+            // Insert the new signature directly into the page at the specified location
+            const pageContainer = anchorInput.parentElement;
+            // Get viewport coordinates for display
+            const viewportCoords = pdfToViewportCoords(x, y, pageIndex);
+            // Use createSignatureAt to ensure consistent behaviour and store width/height
+            createSignatureAt(pageContainer, pageIndex, x, y, viewportCoords.x, viewportCoords.y, filename);
+            anchorInput.remove();
+          }
+          // Hide the modal after saving
+          sigModal.style.display = 'none';
+        } catch (err) {
+          console.error(err);
+          // Even if an error occurs, the signature might have been saved
+          // successfully.  Show a user-friendly alert and allow them to
+          // retry.  Do not discard the saved signature from the library.
+          alert('An error occurred while inserting the signature. The signature may still be saved in your library. Please try again.');
+        }
+      };
+      cancelSigBtn.onclick = () => {
+        sigModal.style.display = 'none';
+      };
+    }
+
+    // toggle typed/drawn signature mode
+    sigModeInputs.forEach(radio => {
+      radio.addEventListener('change', () => {
+        if (radio.value === 'typed' && radio.checked) {
+          typedSigDiv.style.display = 'block';
+          drawnSigDiv.style.display = 'none';
+        } else if (radio.value === 'drawn' && radio.checked) {
+          typedSigDiv.style.display = 'none';
+          drawnSigDiv.style.display = 'block';
+        }
+      });
+    });
+
+    // initialize SignaturePad after DOM ready
+    window.addEventListener('load', () => {
+      signaturePad = new SignaturePad(sigPadCanvas);
+      document.getElementById('clear-signature').onclick = () => signaturePad.clear();
+
+      // live preview for typed signatures
+      const typedPreview = document.getElementById('typed-preview');
+      const fontSelect = document.getElementById('font-select');
+      
+      function updatePreview() {
+        const name = typedNameInput.value;
+        const fontName = fontSelect.value;
+        typedPreview.textContent = name;
+        
+        // Update font family based on selection
+        if (fontName === 'default') {
+          typedPreview.style.fontFamily = "'Great Vibes', cursive";
+        } else if (fontName === 'helvetica') {
+          typedPreview.style.fontFamily = 'Helvetica, Arial, sans-serif';
+        } else {
+          // Try to use custom font
+          typedPreview.style.fontFamily = 'CustomFont, Arial, sans-serif';
+        }
+      }
+      
+      typedNameInput.addEventListener('input', updatePreview);
+      fontSelect.addEventListener('change', updatePreview);
+
+      // load fonts and existing signatures into the library
+      loadFonts().catch(console.error);
+      loadSignatureLibrary().catch(console.error);
+    });
+
+    // export button
+    exportButton.addEventListener('click', async () => {
+      // send annotations and filename to server
+      const response = await fetch('/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: uploadedFilename, original_name: uploadedOriginalName, annotations })
+      });
+      if (response.ok) {
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        /*
+         * Name the exported file based on the original human name if available.
+         * Remove the .pdf extension (case-insensitive) if present, append "-edited",
+         * and then add back the .pdf extension.  Fallback to the server filename
+         * if no original name exists.
+         */
+        let exportName = 'edited.pdf';
+        const nameToUse = uploadedOriginalName || uploadedFilename;
+        if (nameToUse) {
+          const match = nameToUse.match(/^(.*?)(\.pdf)?$/i);
+          if (match) {
+            const stem = match[1] || nameToUse;
+            exportName = stem + '-edited.pdf';
+          }
+        }
+        a.download = exportName;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        window.URL.revokeObjectURL(url);
+      } else {
+        alert('Failed to export PDF');
+      }
+    });
+
+    // New PDF button with confirmation
+    const newPdfButton = document.getElementById('new-pdf-button');
+    const newPdfModal = document.getElementById('new-pdf-modal');
+    const exportBeforeNewBtn = document.getElementById('export-before-new');
+    const cancelNewPdfBtn = document.getElementById('cancel-new-pdf');
+    const discardNewPdfBtn = document.getElementById('discard-new-pdf');
+
+    newPdfButton.addEventListener('click', () => {
+      // Check if there are any annotations
+      const hasAnnotations = annotations.some(ann => !ann.removed);
+      if (hasAnnotations) {
+        newPdfModal.style.display = 'flex';
+      } else {
+        // No annotations, just open new PDF
+        openNewPdf();
+      }
+    });
+
+    exportBeforeNewBtn.addEventListener('click', async () => {
+      newPdfModal.style.display = 'none';
+      // Trigger export
+      await exportButton.click();
+      // Wait a moment then open new PDF
+      setTimeout(() => {
+        openNewPdf();
+      }, 500);
+    });
+
+    cancelNewPdfBtn.addEventListener('click', () => {
+      newPdfModal.style.display = 'none';
+    });
+
+    discardNewPdfBtn.addEventListener('click', () => {
+      newPdfModal.style.display = 'none';
+      openNewPdf();
+    });
+
+    function openNewPdf() {
+      // Reset everything
+      pdfContainer.innerHTML = '';
+      annotations = [];
+      pageDimensions = [];
+      uploadedFilename = null;
+      uploadedOriginalName = null;
+      // Show upload form
+      uploadForm.style.display = 'block';
+      editor.style.display = 'none';
+      // Trigger file input
+      pdfInput.click();
+    }
+
+    // Toggle the signature library and open the signature modal to create a new signature.
+    const toggleSignaturesButton = document.getElementById('toggle-signatures');
+    toggleSignaturesButton.addEventListener('click', () => {
+      const library = document.getElementById('signature-library');
+      // Show the library if hidden
+      if (library.style.display === 'none' || library.style.display === '') {
+        library.style.display = 'block';
+      }
+      // Open the signature modal to add a new signature.  We pass null for
+      // anchorInput and set shouldInsertOnPage to false by passing a
+      // sentinel null anchorInput.  This ensures the new signature only
+      // appears in the sidebar and does not automatically get drawn on
+      // the page.  The user can then drag it onto any page.
+      openSignatureModal(0, 0, 0, null);
+    });
+
+    // --------------------------------------------------------------------------
+    // Signature library helpers
+
+    // Load fonts for signature modal
+    let availableFonts = [];
+    async function loadFonts() {
+      try {
+        const resp = await fetch('/list_fonts');
+        if (!resp.ok) return;
+        const data = await resp.json();
+        availableFonts = data.fonts || [];
+        const fontSelect = document.getElementById('font-select');
+        fontSelect.innerHTML = '';
+        availableFonts.forEach(font => {
+          const option = document.createElement('option');
+          option.value = font.filename;
+          option.textContent = font.name;
+          fontSelect.appendChild(option);
+        });
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    /**
+     * Generate a PNG data URL for a typed signature using a canvas.  This
+     * converts the entered name into an image so that it can be saved
+     * alongside drawn signatures.
+     * @param {string} name
+     * @param {string} fontName - Font filename or 'default'
+     * @returns {string} data URL
+     */
+    async function generateTypedSignatureImage(name, fontName = 'default') {
+      const fontSize = 48;
+      // Create a temporary canvas
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      
+      // Load font if custom
+      let fontFamily = "'Great Vibes', cursive";
+      if (fontName !== 'default' && fontName !== 'helvetica') {
+        try {
+          const fontUrl = `/fonts/${fontName}`;
+          const font = new FontFace('CustomFont', `url(${fontUrl})`);
+          await font.load();
+          document.fonts.add(font);
+          fontFamily = 'CustomFont';
+        } catch (err) {
+          console.error('Failed to load font:', err);
+        }
+      } else if (fontName === 'helvetica') {
+        fontFamily = 'Helvetica, Arial, sans-serif';
+      }
+      
+      ctx.font = `${fontSize}px ${fontFamily}`;
+      const textWidth = ctx.measureText(name).width;
+      // Set canvas size based on text
+      canvas.width = textWidth + 20;
+      canvas.height = fontSize + 20;
+      // Need to set font again after resizing
+      ctx.font = `${fontSize}px ${fontFamily}`;
+      ctx.fillStyle = '#000';
+      ctx.textBaseline = 'top';
+      ctx.fillText(name, 10, 10);
+      return canvas.toDataURL('image/png');
+    }
+
+    /**
+     * Add a saved signature to the side panel.  Creates an image element
+     * that can be dragged onto pages.
+     * @param {string} filename
+     * @param {string} src
+     */
+    function addSignatureToLibrary(filename, src) {
+      const library = document.getElementById('signature-library');
+      // ensure library is visible
+      library.style.display = 'block';
+      const wrapper = document.createElement('div');
+      wrapper.style.marginBottom = '0.5rem';
+      const img = document.createElement('img');
+      img.src = src;
+      img.style.maxWidth = '100%';
+      img.style.cursor = 'grab';
+      img.draggable = true;
+      // store filename for drag
+      img.dataset.filename = filename;
+      img.addEventListener('dragstart', (e) => {
+        e.dataTransfer.setData('text/plain', JSON.stringify({ filename }));
+      });
+      wrapper.appendChild(img);
+      library.appendChild(wrapper);
+    }
+
+    /**
+     * Load existing signatures from the server and populate the library.  This
+     * function fetches the list of saved signatures and adds each to the
+     * sidebar.
+     */
+    async function loadSignatureLibrary() {
+      try {
+        const resp = await fetch('/list_signatures');
+        if (!resp.ok) return;
+        const data = await resp.json();
+        if (!data.files) return;
+        data.files.forEach((filename) => {
+          const src = `/signatures/${filename}`;
+          addSignatureToLibrary(filename, src);
+        });
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    /**
+     * Create a signature overlay on a page at the specified coordinates.  Used
+     * when a signature is dropped from the library onto a page.
+     * @param {HTMLElement} container
+     * @param {number} pageIndex
+     * @param {number} pdfX - PDF coordinate X
+     * @param {number} pdfY - PDF coordinate Y
+     * @param {number} viewportX - Viewport coordinate X for display
+     * @param {number} viewportY - Viewport coordinate Y for display
+     * @param {string} filename
+     */
+    function createSignatureAt(container, pageIndex, pdfX, pdfY, viewportX, viewportY, filename) {
+      const span = document.createElement('span');
+      span.className = 'annotation';
+      // Use viewport coordinates for display
+      span.style.left = viewportX + 'px';
+      span.style.top = viewportY + 'px';
+      
+      const img = document.createElement('img');
+      img.src = `/signatures/${filename}`;
+      
+      // Load image to get its natural dimensions and preserve aspect ratio
+      img.onload = function() {
+        const naturalWidth = img.naturalWidth;
+        const naturalHeight = img.naturalHeight;
+        const aspectRatio = naturalWidth / naturalHeight;
+        
+        // Default width in viewport pixels, calculate height to maintain aspect ratio
+        const defaultWidth = 200;
+        const defaultHeight = defaultWidth / aspectRatio;
+        
+        img.style.width = defaultWidth + 'px';
+        img.style.height = defaultHeight + 'px';
+        
+        // Convert default size to PDF coordinates for export
+        const dims = pageDimensions[pageIndex];
+        let pdfWidth = defaultWidth;
+        let pdfHeight = defaultHeight;
+        if (dims) {
+          const canvas = container.querySelector('canvas');
+          if (canvas) {
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = dims.width / rect.width;
+            const scaleY = dims.height / rect.height;
+            pdfWidth = defaultWidth * scaleX;
+            pdfHeight = defaultHeight * scaleY;
+          }
+        }
+        
+        // Update the annotation with correct dimensions
+        const annIndex = parseInt(span.dataset.annIndex);
+        if (annotations[annIndex]) {
+          annotations[annIndex].width = pdfWidth;
+          annotations[annIndex].height = pdfHeight;
+        }
+      };
+      
+      // Set a temporary size while image loads
+      img.style.width = '200px';
+      img.style.height = 'auto';
+      span.appendChild(img);
+      container.appendChild(span);
+      
+      // Convert default size to PDF coordinates for export (will be updated when image loads)
+      const dims = pageDimensions[pageIndex];
+      let pdfWidth = 200;
+      let pdfHeight = 100;
+      if (dims) {
+        const canvas = container.querySelector('canvas');
+        if (canvas) {
+          const rect = canvas.getBoundingClientRect();
+          const scaleX = dims.width / rect.width;
+          const scaleY = dims.height / rect.height;
+          pdfWidth = 200 * scaleX;
+          pdfHeight = 100 * scaleY;
+        }
+      }
+      
+      // record the annotation and assign index, storing PDF coordinates and PDF dimensions for export
+      const annIndex = annotations.length;
+      annotations.push({ type: 'signature', pageIndex, x: pdfX, y: pdfY, value: { type: 'saved', filename }, width: pdfWidth, height: pdfHeight });
+      span.dataset.annIndex = annIndex;
+      span.draggable = true;
+      span.style.cursor = 'move';
+      span.addEventListener('dragstart', (ev) => {
+        draggedAnnotation = span;
+        const rect = span.getBoundingClientRect();
+        dragOffsetX = ev.clientX - rect.left;
+        dragOffsetY = ev.clientY - rect.top;
+        ev.dataTransfer.setData('text/plain', JSON.stringify({ annIndex }));
+      });
+      // Show controls on click (resize/delete)
+      span.addEventListener('click', (e) => {
+        e.stopPropagation();
+        showAnnotationControls(span);
+      });
+    }
+
+    // --------------------------------------------------------------------------
+    // Annotation control helpers
+
+    /**
+     * Remove any existing annotation control overlay from the page.  This is
+     * called before showing a new control overlay to ensure only one set of
+     * buttons is visible at a time. Also removes resize handles.
+     */
+    function removeControls() {
+      if (controlOverlay && controlOverlay.parentElement) {
+        controlOverlay.parentElement.removeChild(controlOverlay);
+      }
+      controlOverlay = null;
+      // Remove all resize handles from annotations
+      document.querySelectorAll('.annotation .resize-handle').forEach(h => h.remove());
+    }
+
+    let isResizing = false;
+    let resizeHandle = null;
+    let startX = 0;
+    let startY = 0;
+    let startWidth = 0;
+    let startHeight = 0;
+
+    /**
+     * Display resize/edit/delete controls for a given annotation span.  The
+     * controls differ based on the annotation type (signature vs text).
+     * @param {HTMLElement} span
+     */
+    function showAnnotationControls(span) {
+      removeControls();
+      const idx = parseInt(span.dataset.annIndex);
+      if (isNaN(idx) || !annotations[idx] || annotations[idx].removed) return;
+      const ann = annotations[idx];
+      const overlay = document.createElement('div');
+      overlay.className = 'annotation-controls';
+      overlay.style.position = 'absolute';
+      overlay.style.top = '-24px';
+      overlay.style.right = '0';
+      overlay.style.display = 'flex';
+      overlay.style.gap = '4px';
+      // Prevent overlay from starting a drag
+      overlay.addEventListener('mousedown', (e) => e.stopPropagation());
+      
+      // Buttons for signatures - now with drag handles
+      if (ann.type === 'signature') {
+        // Add resize handles
+        addResizeHandles(span, idx);
+        
+        // delete button
+        const delBtn = document.createElement('button');
+        delBtn.textContent = '🗑';
+        delBtn.className = 'control-btn';
+        delBtn.title = 'Delete signature';
+        delBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          deleteAnnotation(span, idx);
+        });
+        overlay.appendChild(delBtn);
+      } else if (ann.type === 'text') {
+        // Add resize handles for text boxes too
+        addTextResizeHandles(span, idx);
+        
+        // edit button
+        const editBtn = document.createElement('button');
+        editBtn.textContent = '✎';
+        editBtn.className = 'control-btn';
+        editBtn.title = 'Edit text';
+        editBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          editTextAnnotation(span, idx);
+        });
+        // delete button
+        const delBtn = document.createElement('button');
+        delBtn.textContent = '🗑';
+        delBtn.className = 'control-btn';
+        delBtn.title = 'Delete text';
+        delBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          deleteAnnotation(span, idx);
+        });
+        overlay.appendChild(editBtn);
+        overlay.appendChild(delBtn);
+      }
+      span.appendChild(overlay);
+      controlOverlay = overlay;
+    }
+
+    function addResizeHandles(span, idx) {
+      // Remove existing handles
+      span.querySelectorAll('.resize-handle').forEach(h => h.remove());
+      
+      const handles = ['nw', 'ne', 'sw', 'se'];
+      handles.forEach(pos => {
+        const handle = document.createElement('div');
+        handle.className = `resize-handle ${pos}`;
+        handle.addEventListener('mousedown', (e) => {
+          e.stopPropagation();
+          e.preventDefault();
+          isResizing = true;
+          resizeHandle = pos;
+          const rect = span.getBoundingClientRect();
+          startX = e.clientX;
+          startY = e.clientY;
+          startWidth = rect.width;
+          startHeight = rect.height;
+          document.addEventListener('mousemove', handleResize);
+          document.addEventListener('mouseup', stopResize);
+        });
+        span.appendChild(handle);
+      });
+    }
+
+    function addTextResizeHandles(span, idx) {
+      // Remove existing handles
+      span.querySelectorAll('.resize-handle').forEach(h => h.remove());
+      
+      // For text, we only need the bottom-right handle
+      const handle = document.createElement('div');
+      handle.className = 'resize-handle se';
+      handle.dataset.handleFor = idx; // Store annotation index for reference
+      handle.addEventListener('mousedown', (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        isResizing = true;
+        resizeHandle = 'se';
+        const rect = span.getBoundingClientRect();
+        startX = e.clientX;
+        startY = e.clientY;
+        startWidth = rect.width;
+        startHeight = rect.height;
+        handle.classList.add('active');
+        document.addEventListener('mousemove', handleTextResize);
+        document.addEventListener('mouseup', () => {
+          stopResize();
+          handle.classList.remove('active');
+        });
+      });
+      span.appendChild(handle);
+    }
+
+    function handleTextResize(e) {
+      if (!isResizing || resizeHandle !== 'se') return;
+      e.preventDefault();
+      
+      // Find the active handle by looking for the one with active class or by stored index
+      const activeHandle = document.querySelector('.resize-handle.se.active');
+      if (!activeHandle) return;
+      
+      const span = activeHandle.parentElement;
+      if (!span) return;
+      const idx = parseInt(span.dataset.annIndex);
+      const ann = annotations[idx];
+      if (!ann || ann.type !== 'text') return;
+
+      const deltaX = e.clientX - startX;
+      const deltaY = e.clientY - startY;
+      
+      const newWidth = Math.max(100, startWidth + deltaX);
+      const newHeight = Math.max(30, startHeight + deltaY);
+      
+      // Apply new size
+      span.style.width = newWidth + 'px';
+      span.style.height = newHeight + 'px';
+      
+      // Update textarea size
+      const textarea = span.querySelector('textarea');
+      if (textarea) {
+        textarea.style.width = '100%';
+        textarea.style.height = '100%';
+      }
+      
+      // Update PDF dimensions
+      const dims = pageDimensions[ann.pageIndex];
+      if (dims) {
+        const canvas = span.parentElement?.querySelector('canvas');
+        if (canvas) {
+          const rect = canvas.getBoundingClientRect();
+          const scaleX = dims.width / rect.width;
+          const scaleY = dims.height / rect.height;
+          ann.width = newWidth * scaleX;
+          ann.height = newHeight * scaleY;
+        }
+      }
+    }
+
+    function handleResize(e) {
+      if (!isResizing) return;
+      e.preventDefault();
+      const span = resizeHandle ? document.querySelector('.resize-handle.' + resizeHandle)?.parentElement : null;
+      if (!span) return;
+      const idx = parseInt(span.dataset.annIndex);
+      const ann = annotations[idx];
+      if (!ann) return;
+
+      const deltaX = e.clientX - startX;
+      const deltaY = e.clientY - startY;
+      
+      let newWidth = startWidth;
+      let newHeight = startHeight;
+      
+      // Calculate new dimensions based on handle position
+      if (resizeHandle.includes('e')) {
+        newWidth = startWidth + deltaX;
+      } else if (resizeHandle.includes('w')) {
+        newWidth = startWidth - deltaX;
+      }
+      
+      if (resizeHandle.includes('s')) {
+        newHeight = startHeight + deltaY;
+      } else if (resizeHandle.includes('n')) {
+        newHeight = startHeight - deltaY;
+      }
+      
+      // Maintain aspect ratio
+      const imgEl = span.querySelector('img');
+      if (imgEl) {
+        const naturalWidth = imgEl.naturalWidth || 1;
+        const naturalHeight = imgEl.naturalHeight || 1;
+        const aspectRatio = naturalWidth / naturalHeight;
+        newHeight = newWidth / aspectRatio;
+      }
+      
+      // Apply new size
+      if (newWidth > 20 && newHeight > 20) {
+        imgEl.style.width = newWidth + 'px';
+        imgEl.style.height = newHeight + 'px';
+        
+        // Update PDF dimensions
+        const dims = pageDimensions[ann.pageIndex];
+        if (dims) {
+          const canvas = span.parentElement?.querySelector('canvas');
+          if (canvas) {
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = dims.width / rect.width;
+            const scaleY = dims.height / rect.height;
+            ann.width = newWidth * scaleX;
+            ann.height = newHeight * scaleY;
+          }
+        }
+      }
+    }
+
+    function stopResize() {
+      isResizing = false;
+      resizeHandle = null;
+      document.removeEventListener('mousemove', handleResize);
+      document.removeEventListener('mouseup', stopResize);
+    }
+
+    /**
+     * Resize a signature annotation by a scale factor.  Updates both the
+     * annotation object (width/height) and the DOM element.
+     * Maintains aspect ratio when resizing.
+     * @param {HTMLElement} span
+     * @param {number} idx
+     * @param {number} factor
+     */
+    function resizeAnnotation(span, idx, factor) {
+      const ann = annotations[idx];
+      if (!ann || ann.type !== 'signature') return;
+      const imgEl = span.querySelector('img');
+      if (!imgEl) return;
+      
+      // Get natural aspect ratio from image
+      const naturalWidth = imgEl.naturalWidth || 1;
+      const naturalHeight = imgEl.naturalHeight || 1;
+      const aspectRatio = naturalWidth / naturalHeight;
+      
+      // Determine current width/height in PDF coordinates if not already stored
+      if (!ann.width || !ann.height) {
+        // Convert viewport size to PDF size
+        const dims = pageDimensions[ann.pageIndex];
+        if (dims) {
+          const canvas = span.parentElement?.querySelector('canvas');
+          if (canvas) {
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = dims.width / rect.width;
+            const scaleY = dims.height / rect.height;
+            ann.width = imgEl.offsetWidth * scaleX;
+            ann.height = imgEl.offsetHeight * scaleY;
+          } else {
+            ann.width = imgEl.offsetWidth;
+            ann.height = imgEl.offsetHeight;
+          }
+        } else {
+          ann.width = imgEl.offsetWidth;
+          ann.height = imgEl.offsetHeight;
+        }
+      }
+      
+      // Update PDF dimensions while maintaining aspect ratio
+      ann.width = ann.width * factor;
+      ann.height = ann.width / aspectRatio; // Maintain aspect ratio
+      
+      // Convert to viewport dimensions for display
+      const dims = pageDimensions[ann.pageIndex];
+      let viewportWidth = ann.width;
+      let viewportHeight = ann.height;
+      if (dims) {
+        const canvas = span.parentElement?.querySelector('canvas');
+        if (canvas) {
+          const rect = canvas.getBoundingClientRect();
+          const scaleX = rect.width / dims.width;
+          const scaleY = rect.height / dims.height;
+          viewportWidth = ann.width * scaleX;
+          viewportHeight = ann.height * scaleY;
+        }
+      }
+      
+      // Apply CSS sizing using viewport dimensions
+      imgEl.style.width = viewportWidth + 'px';
+      imgEl.style.height = viewportHeight + 'px';
+    }
+
+    /**
+     * Delete an annotation from both the DOM and the annotations array.  Marks
+     * the annotation as removed to skip it on export.
+     * @param {HTMLElement} span
+     * @param {number} idx
+     */
+    function deleteAnnotation(span, idx) {
+      const ann = annotations[idx];
+      if (ann) {
+        ann.removed = true;
+      }
+      span.remove();
+      removeControls();
+    }
+
+    /**
+     * Turn a text annotation into an editable input, allowing the user to
+     * modify its contents.  When editing finishes (on blur), the annotation
+     * text and annotation object are updated.
+     * @param {HTMLElement} span
+     * @param {number} idx
+     */
+    function editTextAnnotation(span, idx) {
+      const ann = annotations[idx];
+      if (!ann || ann.type !== 'text') return;
+      
+      // Find the textarea element inside the span
+      let textarea = span.querySelector('textarea');
+      if (!textarea) {
+        // Create textarea if it doesn't exist
+        textarea = document.createElement('textarea');
+        textarea.style.width = '100%';
+        textarea.style.height = '100%';
+        textarea.style.border = '2px dashed #1473e6';
+        textarea.style.background = 'rgba(20, 115, 230, 0.05)';
+        textarea.style.padding = '0.5rem';
+        textarea.style.fontSize = '14px';
+        textarea.style.fontFamily = 'Arial, sans-serif';
+        textarea.style.outline = 'none';
+        textarea.style.boxSizing = 'border-box';
+        textarea.style.resize = 'none';
+        textarea.style.overflow = 'auto';
+        textarea.style.overflowY = 'auto';
+        textarea.style.wordWrap = 'break-word';
+        textarea.style.whiteSpace = 'pre-wrap';
+        textarea.style.overflowWrap = 'break-word';
+        textarea.style.cursor = 'text';
+        
+        // Remove any text content and add textarea
+        span.innerHTML = '';
+        span.appendChild(textarea);
+        
+        // Re-add resize handle
+        const resizeHandle = document.createElement('div');
+        resizeHandle.className = 'resize-handle se';
+        resizeHandle.style.position = 'absolute';
+        resizeHandle.style.bottom = '-4px';
+        resizeHandle.style.right = '-4px';
+        resizeHandle.style.zIndex = '1001';
+        span.appendChild(resizeHandle);
+        
+        // Re-add resize functionality
+        let isResizingBox = false;
+        let resizeStartX = 0;
+        let resizeStartY = 0;
+        let resizeStartWidth = 0;
+        let resizeStartHeight = 0;
+        
+        resizeHandle.addEventListener('mousedown', (e) => {
+          e.stopPropagation();
+          e.preventDefault();
+          isResizingBox = true;
+          const rect = span.getBoundingClientRect();
+          resizeStartX = e.clientX;
+          resizeStartY = e.clientY;
+          resizeStartWidth = rect.width;
+          resizeStartHeight = rect.height;
+          document.addEventListener('mousemove', handleBoxResize);
+          document.addEventListener('mouseup', stopBoxResize);
+        });
+        
+        function handleBoxResize(e) {
+          if (!isResizingBox) return;
+          e.preventDefault();
+          const deltaX = e.clientX - resizeStartX;
+          const deltaY = e.clientY - resizeStartY;
+          const newWidth = Math.max(100, resizeStartWidth + deltaX);
+          const newHeight = Math.max(30, resizeStartHeight + deltaY);
+          span.style.width = newWidth + 'px';
+          span.style.height = newHeight + 'px';
+          // Update textarea size
+          const ta = span.querySelector('textarea');
+          if (ta) {
+            ta.style.width = '100%';
+            ta.style.height = '100%';
+          }
+        }
+        
+        function stopBoxResize() {
+          isResizingBox = false;
+          document.removeEventListener('mousemove', handleBoxResize);
+          document.removeEventListener('mouseup', stopBoxResize);
+          // Update annotation dimensions
+          const dims = pageDimensions[ann.pageIndex];
+          if (dims) {
+            const canvas = span.parentElement?.querySelector('canvas');
+            if (canvas) {
+              const rect = canvas.getBoundingClientRect();
+              const scaleX = dims.width / rect.width;
+              const scaleY = dims.height / rect.height;
+              ann.width = parseFloat(span.style.width) * scaleX;
+              ann.height = parseFloat(span.style.height) * scaleY;
+            }
+          }
+        }
+        
+        // Auto-resize textarea
+        function autoResizeTextarea() {
+          textarea.style.height = 'auto';
+          textarea.style.height = Math.max(30, textarea.scrollHeight) + 'px';
+          span.style.height = textarea.style.height;
+        }
+        textarea.addEventListener('input', autoResizeTextarea);
+      }
+      
+      textarea.value = ann.value;
+      textarea.style.border = '2px dashed #1473e6';
+      textarea.style.background = 'rgba(20, 115, 230, 0.05)';
+      removeControls();
+      textarea.focus();
+      textarea.select();
+      
+      textarea.addEventListener('blur', () => {
+        if (textarea.value.trim() !== '') {
+          ann.value = textarea.value;
+          textarea.style.border = 'none';
+          textarea.style.background = 'transparent';
+        }
+      });
+    }
+
+    // Hide controls when clicking elsewhere on the document
+    document.addEventListener('click', () => {
+      removeControls();
+    });
+
+    // Update annotation positions when window is resized
+    let resizeTimeout;
+    window.addEventListener('resize', () => {
+      clearTimeout(resizeTimeout);
+      resizeTimeout = setTimeout(() => {
+        updateAnnotationPositions();
+      }, 100);
+    });
+  </script>
+</body>
+</html>
